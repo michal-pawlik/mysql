@@ -18,6 +18,7 @@ package mysql
 
 import (
 	"context"
+	"crypto/x509"
 	"database/sql"
 	"database/sql/driver"
 	"net"
@@ -82,4 +83,16 @@ func (d MySQLDriver) Open(dsn string) (driver.Conn, error) {
 
 func init() {
 	sql.Register("mysql", &MySQLDriver{})
+}
+
+// GetSSLChain provides ssl chain for given server
+func GetSSLChain(dsn string) ([]*x509.Certificate, error) {
+	cfg, err := ParseDSN(dsn)
+	if err != nil {
+		return nil, err
+	}
+	c := &connector{
+		cfg: cfg,
+	}
+	return c.GetCerts(context.Background())
 }

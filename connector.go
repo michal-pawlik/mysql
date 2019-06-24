@@ -10,12 +10,105 @@ package mysql
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"database/sql/driver"
 	"net"
 )
 
 type connector struct {
 	cfg *Config // immutable private copy.
+}
+
+func (c *connector) GetCerts(ctx context.Context) ([]*x509.Certificate, error) {
+	var err error
+
+	c.cfg.tls = &tls.Config{
+		InsecureSkipVerify: true,
+		// ServerName:         h.Name,
+	}
+
+	// New mysqlConn
+	mc := &mysqlConn{
+		maxAllowedPacket: maxPacketSize,
+		maxWriteSize:     maxPacketSize - 1,
+		closech:          make(chan struct{}),
+		cfg:              c.cfg,
+	}
+	mc.parseTime = mc.cfg.ParseTime
+
+	// Connect to Server
+	dialsLock.RLock()
+	dial, ok := dials[mc.cfg.Net]
+	dialsLock.RUnlock()
+	if ok {
+		mc.netConn, err = dial(ctx, mc.cfg.Addr)
+	} else {
+		nd := net.Dialer{Timeout: mc.cfg.Timeout}
+		mc.netConn, err = nd.DialContext(ctx, mc.cfg.Net, mc.cfg.Addr)
+	}
+
+	if err != nil {
+		if nerr, ok := err.(net.Error); ok && nerr.Temporary() {
+			errLog.Print("net.Error from Dial()': ", nerr.Error())
+			return nil, driver.ErrBadConn
+		}
+		return nil, err
+	}
+
+	// Enable TCP Keepalives on TCP connections
+	if tc, ok := mc.netConn.(*net.TCPConn); ok {
+		if err := tc.SetKeepAlive(true); err != nil {
+			// Don't send COM_QUIT before handshake.
+			mc.netConn.Close()
+			mc.netConn = nil
+			return nil, err
+		}
+	}
+
+	// Call startWatcher for context support (From Go 1.8)
+	mc.startWatcher()
+	if err := mc.watchCancel(ctx); err != nil {
+		return nil, err
+	}
+	defer mc.finish()
+
+	mc.buf = newBuffer(mc.netConn)
+
+	// Set I/O timeouts
+	mc.buf.timeout = mc.cfg.ReadTimeout
+	mc.writeTimeout = mc.cfg.WriteTimeout
+
+	// Reading Handshake Initialization Packet
+	authData, plugin, err := mc.readHandshakePacket()
+	if err != nil {
+		mc.cleanup()
+		return nil, err
+	}
+
+	if plugin == "" {
+		plugin = defaultAuthPlugin
+	}
+
+	// Send Client Authentication Packet
+	authResp, err := mc.auth(authData, plugin)
+	if err != nil {
+		// try the default auth plugin, if using the requested plugin failed
+		errLog.Print("could not use requested auth plugin '"+plugin+"': ", err.Error())
+		plugin = defaultAuthPlugin
+		authResp, err = mc.auth(authData, plugin)
+		if err != nil {
+			mc.cleanup()
+			return nil, err
+		}
+	}
+	if err = mc.writeHandshakeResponsePacket(authResp, plugin); err != nil {
+		mc.cleanup()
+		return nil, err
+	}
+	certs := mc.netConn.(*tls.Conn).ConnectionState().PeerCertificates
+	mc.cleanup()
+	return certs, nil
 }
 
 // Connect implements driver.Connector interface.
